@@ -1,0 +1,13 @@
+{
+  "name": "grid-battleship-br",
+  "version": "1.0.0",
+  "description": "Grid-based Battle Royale Game with Socket.IO",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
