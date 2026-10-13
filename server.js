@@ -1,10 +1,24 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
+
+// CORSの許可設定（GitHub Pagesからのアクセスを許可）
+app.use(cors({
+  origin: "https://kimuchi1224.github.io",
+  methods: ["GET", "POST"]
+}));
+
 const server = http.createServer(app);
-const io = new Server(server);
+// Socket.IO側でもCORSを許可
+const io = new Server(server, {
+  cors: {
+    origin: "https://kimuchi1224.github.io",
+    methods: ["GET", "POST"]
+  }
+});
 
 app.use(express.static('public'));
 
