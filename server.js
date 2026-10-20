@@ -70,6 +70,16 @@ io.on('connection', (socket) => {
     isBot: false
   };
 
+  // ★修正: すでにゲームが始まっている最中にリロードなどで再接続した場合のケア
+  if (gameState === 'playing' || gameState === 'ended') {
+    // リロードしたプレイヤーをランダムな位置に配置（または観戦・途中参加扱い）
+    players[socket.id].x = Math.floor(Math.random() * settings.gridSize);
+    players[socket.id].y = Math.floor(Math.random() * settings.gridSize);
+    
+    // そのプレイヤーだけに現在のマップ情報を送る
+    socket.emit('gameStarted', { settings, mapObjects });
+  }
+
   updateGameData();
 
   socket.on('updateSettings', (newSettings) => {
