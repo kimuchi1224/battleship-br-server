@@ -27,21 +27,50 @@ let settings = {
   botCount: 3
 };
 let players = {};
-let mapObjects = {}; // { 'x,y': { elevation: 0/1/2, type: 'treasure'/'grass', opened: true/false } }
+let mapObjects = {}; // { 'x,y': { elevation: 0..3, type: 'treasure'/'grass', opened: true/false } }
 let currentTurn = 0;
 let safeZoneRadius = 5;
 
+// 滑らかな高低差を持つマップ生成
 function generateMap(size) {
   mapObjects = {};
   safeZoneRadius = Math.floor(size / 2);
   const center = Math.floor(size / 2);
 
+  // 1. まず中心付近を基準に高低差を緩やかにランダム配置（セル・オートマトン風の滑らかさ）
+  let gridElevations = Array(size).fill(0).map(() => Array(size).fill(1));
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      // 0〜3の高度をランダムに決定
+      gridElevations[y][x] = Math.floor(Math.random() * 4);
+    }
+  }
+
+  // 2. 隣接マスとの高低差が必ず1段階以内（最大差1）になるよう平滑化パスを通す
+  for (let iter = 0; iter < 2; iter++) {
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        let current = gridElevations[y][x];
+        // 周囲をチェックして差が2以上あれば調整
+        const neighbors = [[x+1, y], [x-1, y], [x, y+1], [x, y-1]];
+        neighbors.forEach(([nx, ny]) => {
+          if (nx >= 0 && nx < size && ny >= 0 && ny < size) {
+            if (Math.abs(current - gridElevations[ny][nx]) >= 2) {
+              // 差が激しすぎる場合は平均化する
+              current = Math.round((current + gridElevations[ny][nx]) / 2);
+            }
+          }
+        });
+        gridElevations[y][x] = Math.max(0, Math.min(3, current));
+      }
+    }
+  }
+
+  // 3. マップオブジェクト（宝箱・草）の配置
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const key = `${x},${y}`;
-      // 高度を 0(低地), 1(平地), 2(高地) でランダム設定
-      const elevation = Math.random() < 0.3 ? 0 : (Math.random() < 0.7 ? 1 : 2);
-      
       let objType = null;
       const rand = Math.random();
       if (rand < 0.15) {
@@ -51,7 +80,7 @@ function generateMap(size) {
       }
 
       mapObjects[key] = {
-        elevation: elevation,
+        elevation: gridElevations[y][x],
         type: objType,
         opened: false
       };
@@ -176,7 +205,6 @@ function checkAllActionsSubmitted() {
   }
 }
 
-// Botの行動制御（高低差を考慮した簡易AI）
 function decideBotActions() {
   const aliveBots = Object.values(players).filter(p => p.alive && p.isBot);
   aliveBots.forEach(bot => {
@@ -202,18 +230,22 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 1. 移動処理
+  // 1. 移動処理（高低差の制限：差が2以上の場合は直接移動不可）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
       const currentCell = mapObjects[`${p.x},${p.y}`];
-      const currentElevation = currentCell ? currentCell.elevation : 1;
+      const targetCell = mapObjects[`${x},${y}`];
       
-      // 高低差による移動範囲チェック（高地なら最大2マス、それ以外は1マス）
-      const maxMove = currentElevation === 2 ? 2 : 1;
+      const currentElevation = currentCell ? currentCell.elevation : 1;
+      const targetElevation = targetCell ? targetCell.elevation : 1;
+      
+      const elevationDiff = Math.abs(currentElevation - targetElevation);
+      const maxMove = currentElevation >= 2 ? 2 : 1;
       const dist = Math.abs(p.x - x) + Math.abs(p.y - y);
 
-      if (dist <= maxMove && x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
+      // 差が2段階以上離れている場合は移動不可
+      if (elevationDiff < 2 && dist <= maxMove && x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
         p.x = x;
         p.y = y;
         logs.push(`${p.name} が (${x}, ${y}) に移動した`);
@@ -225,12 +257,12 @@ function resolveTurn() {
           logs.push(`✨ ${p.name} が宝箱を発見！弾薬+3獲得！`);
         }
       } else {
-        logs.push(`${p.name} の移動先は遠すぎるか不正です`);
+        logs.push(`${p.name} の移動先は高低差が激しすぎるか遠すぎます`);
       }
     }
   });
 
-  // 2. 攻撃処理
+  // 2. 攻撃処理（H3など高い場所から低い場所へは射程ボーナス）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
@@ -245,14 +277,13 @@ function resolveTurn() {
       const attackerElevation = attackerCell ? attackerCell.elevation : 1;
       const targetElevation = targetCell ? targetCell.elevation : 1;
 
-      // 基本射程3。高地から低地への攻撃は射程+1、低地から高地は射程-1
       let maxRange = 3;
-      if (attackerElevation > targetElevation) maxRange += 1;
-      if (attackerElevation < targetElevation) maxRange -= 1;
+      if (attackerElevation > targetElevation) maxRange += (attackerElevation - targetElevation);
+      if (attackerElevation < targetElevation) maxRange -= (targetElevation - attackerElevation);
 
-      const dist = Math.max(Math.abs(p.x - targetX), Math.abs(p.y - targetY)); // Chebyshev距離
+      const dist = Math.max(Math.abs(p.x - targetX), Math.abs(p.y - targetY));
 
-      if (dist <= maxRange && targetX >= 0 && targetX < settings.gridSize && targetY >= 0 && targetY < settings.gridSize) {
+      if (dist <= Math.max(1, maxRange) && targetX >= 0 && targetX < settings.gridSize && targetY >= 0 && targetY < settings.gridSize) {
         logs.push(`${p.name} が (${targetX}, ${targetY}) を砲撃！`);
 
         alivePlayers.forEach(target => {
