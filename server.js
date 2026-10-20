@@ -21,10 +21,10 @@ const io = new Server(server, {
 
 app.use(express.static('public'));
 
-let gameState = 'lobby';
+let gameState = 'lobby'; // 'lobby', 'playing', 'ended'
 let settings = {
   gridSize: 10,
-  botCount: 3 // デフォルトでBotを3体配置
+  botCount: 3
 };
 let players = {};
 let mapObjects = {};
@@ -92,14 +92,14 @@ io.on('connection', (socket) => {
     currentTurn = 1;
     generateMap(settings.gridSize);
 
-    // 1. 一度既存のBotを全削除して初期化
+    // 既存Botの初期化
     for (let id in players) {
       if (players[id].isBot) {
         delete players[id];
       }
     }
 
-    // 2. Botを指定数生成
+    // Bot生成
     for (let i = 1; i <= settings.botCount; i++) {
       const botId = `bot_${i}`;
       players[botId] = {
@@ -117,7 +117,7 @@ io.on('connection', (socket) => {
       };
     }
 
-    // 3. 全プレイヤー（実人＋Bot）をランダム配置
+    // 全プレイヤー配置
     const activePlayers = Object.values(players);
     activePlayers.forEach((p) => {
       p.x = Math.floor(Math.random() * settings.gridSize);
@@ -129,6 +129,23 @@ io.on('connection', (socket) => {
     });
 
     io.emit('gameStarted', { settings, mapObjects });
+    updateGameData();
+  });
+
+  // ロビーに戻る（リスタート準備）
+  socket.on('returnToLobby', () => {
+    gameState = 'lobby';
+    
+    // Botの削除
+    for (let id in players) {
+      if (players[id].isBot) {
+        delete players[id];
+      } else {
+        players[id].ready = false;
+        players[id].action = null;
+        players[id].alive = true;
+      }
+    }
     updateGameData();
   });
 
@@ -149,27 +166,24 @@ function checkAllActionsSubmitted() {
   const alivePlayers = Object.values(players).filter(p => p.alive);
   if (alivePlayers.length === 0) return;
 
-  // すべての生存プレイヤー（実人＋Bot）が行動を選択したかチェック
-  const allSubmitted = alivePlayers.every(p => p.action !== null);
-  if (allSubmitted) {
+  const aliveHumanPlayers = alivePlayers.filter(p => !p.isBot);
+  const allHumansSubmitted = aliveHumanPlayers.every(p => p.action !== null);
+
+  if (allHumansSubmitted) {
+    decideBotActions();
     resolveTurn();
   }
 }
 
-// Botの行動を自動生成する関数
 function decideBotActions() {
   const aliveBots = Object.values(players).filter(p => p.alive && p.isBot);
   aliveBots.forEach(bot => {
-    // 50%の確率で移動、50%の確率で周囲への攻撃
     const isAttack = Math.random() < 0.5 && bot.ammo > 0;
-    
     if (isAttack) {
-      // 近くのランダムなマスを攻撃
       const targetX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + (Math.floor(Math.random() * 3) - 1)));
       const targetY = Math.max(0, Math.min(settings.gridSize - 1, bot.y + (Math.floor(Math.random() * 3) - 1)));
       bot.action = { type: 'attack', targetX, targetY };
     } else {
-      // ランダムな隣接マスへ移動
       const dx = Math.floor(Math.random() * 3) - 1;
       const dy = Math.floor(Math.random() * 3) - 1;
       const newX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + dx));
@@ -179,36 +193,14 @@ function decideBotActions() {
   });
 }
 
-// 全員の行動が揃ったか判定する関数を修正
-function checkAllActionsSubmitted() {
-  const alivePlayers = Object.values(players).filter(p => p.alive);
-  if (alivePlayers.length === 0) return;
-
-  // 生存している「人間プレイヤー（isBot !== true）」だけ抽出
-  const aliveHumanPlayers = alivePlayers.filter(p => !p.isBot);
-
-  // 人間プレイヤー全員が行動を送信したかチェック
-  const allHumansSubmitted = aliveHumanPlayers.every(p => p.action !== null);
-
-  if (allHumansSubmitted) {
-    // 1. 人間が全員揃ったら、ここでBotの行動を自動決定する
-    decideBotActions();
-    
-    // 2. ターン解決処理を実行
-    resolveTurn();
-  }
-}
-
 function resolveTurn() {
-  // ⚠️ decideBotActions() は checkAllActionsSubmitted() 側で呼ぶようにしたため、ここでの呼び出しは削除またはそのままにします
-
   let logs = [];
   const alivePlayers = Object.values(players).filter(p => p.alive);
   const center = Math.floor(settings.gridSize / 2);
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 1. 移動処理
+  // 1. 移動
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
@@ -231,7 +223,7 @@ function resolveTurn() {
     }
   });
 
-  // 2. 攻撃処理
+  // 2. 攻撃
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
@@ -255,7 +247,7 @@ function resolveTurn() {
     }
   });
 
-  // 3. 安全地帯縮小と毒ダメージ
+  // 3. 安全地帯縮小
   if (currentTurn % 3 === 0 && safeZoneRadius > 2) {
     safeZoneRadius--;
     logs.push(`⚠️ 安全地帯が縮小した！（安全半径: ${safeZoneRadius}）`);
@@ -273,7 +265,6 @@ function resolveTurn() {
     }
   });
 
-  // ★重要: 全プレイヤー（人間・Bot両方）の行動選択状態をリセット
   Object.values(players).forEach(p => { p.action = null; });
   currentTurn++;
 
@@ -283,7 +274,7 @@ function resolveTurn() {
     if (remainingAlive.length === 1) {
       logs.push(`🏆 勝利者: ${remainingAlive[0].name} !!!`);
     } else {
-      logs.push(`引き分け`);
+      logs.push(`引き分け (生存者なし)`);
     }
   }
 
