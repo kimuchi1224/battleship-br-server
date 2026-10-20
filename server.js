@@ -179,9 +179,28 @@ function decideBotActions() {
   });
 }
 
+// 全員の行動が揃ったか判定する関数を修正
+function checkAllActionsSubmitted() {
+  const alivePlayers = Object.values(players).filter(p => p.alive);
+  if (alivePlayers.length === 0) return;
+
+  // 生存している「人間プレイヤー（isBot !== true）」だけ抽出
+  const aliveHumanPlayers = alivePlayers.filter(p => !p.isBot);
+
+  // 人間プレイヤー全員が行動を送信したかチェック
+  const allHumansSubmitted = aliveHumanPlayers.every(p => p.action !== null);
+
+  if (allHumansSubmitted) {
+    // 1. 人間が全員揃ったら、ここでBotの行動を自動決定する
+    decideBotActions();
+    
+    // 2. ターン解決処理を実行
+    resolveTurn();
+  }
+}
+
 function resolveTurn() {
-  // ターン解決前にBotに行動を決定させる
-  decideBotActions();
+  // ⚠️ decideBotActions() は checkAllActionsSubmitted() 側で呼ぶようにしたため、ここでの呼び出しは削除またはそのままにします
 
   let logs = [];
   const alivePlayers = Object.values(players).filter(p => p.alive);
@@ -254,7 +273,8 @@ function resolveTurn() {
     }
   });
 
-  alivePlayers.forEach(p => { p.action = null; });
+  // ★重要: 全プレイヤー（人間・Bot両方）の行動選択状態をリセット
+  Object.values(players).forEach(p => { p.action = null; });
   currentTurn++;
 
   const remainingAlive = Object.values(players).filter(p => p.alive);
