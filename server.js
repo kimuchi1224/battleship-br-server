@@ -21,13 +21,13 @@ const io = new Server(server, {
 
 app.use(express.static('public'));
 
-let gameState = 'lobby'; // 'lobby', 'playing', 'ended'
+let gameState = 'lobby';
 let settings = {
   gridSize: 10,
   botCount: 3
 };
 let players = {};
-let mapObjects = {};
+let mapObjects = {}; // { 'x,y': { elevation: 0/1/2, type: 'treasure'/'grass', opened: true/false } }
 let currentTurn = 0;
 let safeZoneRadius = 5;
 
@@ -38,17 +38,23 @@ function generateMap(size) {
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const rand = Math.random();
       const key = `${x},${y}`;
-      const distFromCenter = Math.abs(x - center) + Math.abs(y - center);
+      // 高度を 0(低地), 1(平地), 2(高地) でランダム設定
+      const elevation = Math.random() < 0.3 ? 0 : (Math.random() < 0.7 ? 1 : 2);
       
-      if (rand < 0.15 && distFromCenter > 1) {
-        mapObjects[key] = { type: 'rock' };
-      } else if (rand < 0.25) {
-        mapObjects[key] = { type: 'treasure', opened: false };
-      } else if (rand < 0.40) {
-        mapObjects[key] = { type: 'grass' };
+      let objType = null;
+      const rand = Math.random();
+      if (rand < 0.15) {
+        objType = 'treasure';
+      } else if (rand < 0.30) {
+        objType = 'grass';
       }
+
+      mapObjects[key] = {
+        elevation: elevation,
+        type: objType,
+        opened: false
+      };
     }
   }
 }
@@ -70,13 +76,9 @@ io.on('connection', (socket) => {
     isBot: false
   };
 
-  // ★修正: すでにゲームが始まっている最中にリロードなどで再接続した場合のケア
   if (gameState === 'playing' || gameState === 'ended') {
-    // リロードしたプレイヤーをランダムな位置に配置（または観戦・途中参加扱い）
     players[socket.id].x = Math.floor(Math.random() * settings.gridSize);
     players[socket.id].y = Math.floor(Math.random() * settings.gridSize);
-    
-    // そのプレイヤーだけに現在のマップ情報を送る
     socket.emit('gameStarted', { settings, mapObjects });
   }
 
@@ -102,14 +104,10 @@ io.on('connection', (socket) => {
     currentTurn = 1;
     generateMap(settings.gridSize);
 
-    // 既存Botの初期化
     for (let id in players) {
-      if (players[id].isBot) {
-        delete players[id];
-      }
+      if (players[id].isBot) delete players[id];
     }
 
-    // Bot生成
     for (let i = 1; i <= settings.botCount; i++) {
       const botId = `bot_${i}`;
       players[botId] = {
@@ -127,9 +125,7 @@ io.on('connection', (socket) => {
       };
     }
 
-    // 全プレイヤー配置
-    const activePlayers = Object.values(players);
-    activePlayers.forEach((p) => {
+    Object.values(players).forEach((p) => {
       p.x = Math.floor(Math.random() * settings.gridSize);
       p.y = Math.floor(Math.random() * settings.gridSize);
       p.hp = 100;
@@ -142,11 +138,8 @@ io.on('connection', (socket) => {
     updateGameData();
   });
 
-  // ロビーに戻る（リスタート準備）
   socket.on('returnToLobby', () => {
     gameState = 'lobby';
-    
-    // Botの削除
     for (let id in players) {
       if (players[id].isBot) {
         delete players[id];
@@ -177,21 +170,20 @@ function checkAllActionsSubmitted() {
   if (alivePlayers.length === 0) return;
 
   const aliveHumanPlayers = alivePlayers.filter(p => !p.isBot);
-  const allHumansSubmitted = aliveHumanPlayers.every(p => p.action !== null);
-
-  if (allHumansSubmitted) {
+  if (aliveHumanPlayers.every(p => p.action !== null)) {
     decideBotActions();
     resolveTurn();
   }
 }
 
+// Botの行動制御（高低差を考慮した簡易AI）
 function decideBotActions() {
   const aliveBots = Object.values(players).filter(p => p.alive && p.isBot);
   aliveBots.forEach(bot => {
     const isAttack = Math.random() < 0.5 && bot.ammo > 0;
     if (isAttack) {
-      const targetX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + (Math.floor(Math.random() * 3) - 1)));
-      const targetY = Math.max(0, Math.min(settings.gridSize - 1, bot.y + (Math.floor(Math.random() * 3) - 1)));
+      const targetX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + (Math.floor(Math.random() * 5) - 2)));
+      const targetY = Math.max(0, Math.min(settings.gridSize - 1, bot.y + (Math.floor(Math.random() * 5) - 2)));
       bot.action = { type: 'attack', targetX, targetY };
     } else {
       const dx = Math.floor(Math.random() * 3) - 1;
@@ -210,30 +202,35 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 1. 移動
+  // 1. 移動処理
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
-      if (x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
-        const key = `${x},${y}`;
-        if (mapObjects[key] && mapObjects[key].type === 'rock') {
-          logs.push(`${p.name} は岩に阻まれて移動できなかった`);
-        } else {
-          p.x = x;
-          p.y = y;
-          logs.push(`${p.name} が (${x}, ${y}) に移動した`);
+      const currentCell = mapObjects[`${p.x},${p.y}`];
+      const currentElevation = currentCell ? currentCell.elevation : 1;
+      
+      // 高低差による移動範囲チェック（高地なら最大2マス、それ以外は1マス）
+      const maxMove = currentElevation === 2 ? 2 : 1;
+      const dist = Math.abs(p.x - x) + Math.abs(p.y - y);
 
-          if (mapObjects[key] && mapObjects[key].type === 'treasure' && !mapObjects[key].opened) {
-            mapObjects[key].opened = true;
-            p.ammo += 3;
-            logs.push(`✨ ${p.name} が宝箱を発見！弾薬+3獲得！`);
-          }
+      if (dist <= maxMove && x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
+        p.x = x;
+        p.y = y;
+        logs.push(`${p.name} が (${x}, ${y}) に移動した`);
+
+        const key = `${x},${y}`;
+        if (mapObjects[key] && mapObjects[key].type === 'treasure' && !mapObjects[key].opened) {
+          mapObjects[key].opened = true;
+          p.ammo += 3;
+          logs.push(`✨ ${p.name} が宝箱を発見！弾薬+3獲得！`);
         }
+      } else {
+        logs.push(`${p.name} の移動先は遠すぎるか不正です`);
       }
     }
   });
 
-  // 2. 攻撃
+  // 2. 攻撃処理
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
@@ -242,18 +239,35 @@ function resolveTurn() {
       }
       p.ammo--;
       const { targetX, targetY } = p.action;
-      logs.push(`${p.name} が (${targetX}, ${targetY}) を砲撃！`);
+      
+      const attackerCell = mapObjects[`${p.x},${p.y}`];
+      const targetCell = mapObjects[`${targetX},${targetY}`];
+      const attackerElevation = attackerCell ? attackerCell.elevation : 1;
+      const targetElevation = targetCell ? targetCell.elevation : 1;
 
-      alivePlayers.forEach(target => {
-        if (target.id !== p.id && target.x === targetX && target.y === targetY) {
-          target.hp -= 35;
-          logs.push(`🎯 命中！ ${target.name} に35ダメージ！`);
-          if (target.hp <= 0) {
-            target.alive = false;
-            logs.push(`💀 ${target.name} は沈没した...`);
+      // 基本射程3。高地から低地への攻撃は射程+1、低地から高地は射程-1
+      let maxRange = 3;
+      if (attackerElevation > targetElevation) maxRange += 1;
+      if (attackerElevation < targetElevation) maxRange -= 1;
+
+      const dist = Math.max(Math.abs(p.x - targetX), Math.abs(p.y - targetY)); // Chebyshev距離
+
+      if (dist <= maxRange && targetX >= 0 && targetX < settings.gridSize && targetY >= 0 && targetY < settings.gridSize) {
+        logs.push(`${p.name} が (${targetX}, ${targetY}) を砲撃！`);
+
+        alivePlayers.forEach(target => {
+          if (target.id !== p.id && target.x === targetX && target.y === targetY) {
+            target.hp -= 35;
+            logs.push(`🎯 命中！ ${target.name} に35ダメージ！`);
+            if (target.hp <= 0) {
+              target.alive = false;
+              logs.push(`💀 ${target.name} は沈没した...`);
+            }
           }
-        }
-      });
+        });
+      } else {
+        logs.push(`${p.name} の砲撃は射程外だった...`);
+      }
     }
   });
 
@@ -284,7 +298,7 @@ function resolveTurn() {
     if (remainingAlive.length === 1) {
       logs.push(`🏆 勝利者: ${remainingAlive[0].name} !!!`);
     } else {
-      logs.push(`引き分け (生存者なし)`);
+      logs.push(`引き分け`);
     }
   }
 
