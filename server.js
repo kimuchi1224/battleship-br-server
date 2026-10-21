@@ -27,37 +27,31 @@ let settings = {
   botCount: 3
 };
 let players = {};
-let mapObjects = {}; // { 'x,y': { elevation: 0..3, type: 'treasure'/'grass', opened: true/false } }
+let mapObjects = {};
 let currentTurn = 0;
 let safeZoneRadius = 5;
+let hostSocketId = null; // ホストのID
 
-// 滑らかな高低差を持つマップ生成
 function generateMap(size) {
   mapObjects = {};
   safeZoneRadius = Math.floor(size / 2);
   const center = Math.floor(size / 2);
 
-  // 1. まず中心付近を基準に高低差を緩やかにランダム配置（セル・オートマトン風の滑らかさ）
   let gridElevations = Array(size).fill(0).map(() => Array(size).fill(1));
-
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      // 0〜3の高度をランダムに決定
       gridElevations[y][x] = Math.floor(Math.random() * 4);
     }
   }
 
-  // 2. 隣接マスとの高低差が必ず1段階以内（最大差1）になるよう平滑化パスを通す
   for (let iter = 0; iter < 2; iter++) {
     for (let y = 0; y < size; y++) {
       for (let x = 0; x < size; x++) {
         let current = gridElevations[y][x];
-        // 周囲をチェックして差が2以上あれば調整
         const neighbors = [[x+1, y], [x-1, y], [x, y+1], [x, y-1]];
         neighbors.forEach(([nx, ny]) => {
           if (nx >= 0 && nx < size && ny >= 0 && ny < size) {
             if (Math.abs(current - gridElevations[ny][nx]) >= 2) {
-              // 差が激しすぎる場合は平均化する
               current = Math.round((current + gridElevations[ny][nx]) / 2);
             }
           }
@@ -67,7 +61,6 @@ function generateMap(size) {
     }
   }
 
-  // 3. マップオブジェクト（宝箱・草）の配置
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const key = `${x},${y}`;
@@ -88,22 +81,36 @@ function generateMap(size) {
   }
 }
 
+// ホストを再割り当てする関数
+function assignHostIfNeeded() {
+  const humanSockets = Object.keys(players).filter(id => !players[id].isBot);
+  if (humanSockets.length > 0) {
+    if (!players[hostSocketId] || players[hostSocketId].isBot) {
+      hostSocketId = humanSockets[0];
+    }
+  } else {
+    hostSocketId = null;
+  }
+}
+
 io.on('connection', (socket) => {
   console.log(`ユーザー接続: ${socket.id}`);
 
   players[socket.id] = {
     id: socket.id,
     name: `Player_${socket.id.slice(0, 4)}`,
-    x: 0,
-    y: 0,
     hp: 100,
     ammo: 5,
-    inventory: [],
+    inventory: ['標準砲弾'],
     action: null,
     alive: true,
     ready: false,
-    isBot: false
+    isBot: false,
+    x: 0,
+    y: 0
   };
+
+  assignHostIfNeeded();
 
   if (gameState === 'playing' || gameState === 'ended') {
     players[socket.id].x = Math.floor(Math.random() * settings.gridSize);
@@ -113,8 +120,17 @@ io.on('connection', (socket) => {
 
   updateGameData();
 
+  // ハンドルネーム変更
+  socket.on('updateName', (newName) => {
+    if (players[socket.id] && newName.trim() !== '') {
+      players[socket.id].name = newName.trim().slice(0, 15);
+      updateGameData();
+    }
+  });
+
+  // 設定変更（ホストのみ）
   socket.on('updateSettings', (newSettings) => {
-    if (gameState !== 'lobby') return;
+    if (gameState !== 'lobby' || socket.id !== hostSocketId) return;
     settings.gridSize = parseInt(newSettings.gridSize) || 10;
     settings.botCount = parseInt(newSettings.botCount) !== undefined ? parseInt(newSettings.botCount) : 3;
     io.emit('settingsUpdated', settings);
@@ -126,8 +142,9 @@ io.on('connection', (socket) => {
     updateGameData();
   });
 
+  // ゲーム開始（ホストのみ、または全員準備完了時）
   socket.on('startGame', () => {
-    if (gameState !== 'lobby') return;
+    if (gameState !== 'lobby' || socket.id !== hostSocketId) return;
     
     gameState = 'playing';
     currentTurn = 1;
@@ -142,15 +159,15 @@ io.on('connection', (socket) => {
       players[botId] = {
         id: botId,
         name: `🤖 Bot_${i}`,
-        x: 0,
-        y: 0,
         hp: 100,
         ammo: 5,
-        inventory: [],
+        inventory: ['標準砲弾'],
         action: null,
         alive: true,
         ready: true,
-        isBot: true
+        isBot: true,
+        x: 0,
+        y: 0
       };
     }
 
@@ -164,6 +181,22 @@ io.on('connection', (socket) => {
     });
 
     io.emit('gameStarted', { settings, mapObjects });
+    updateGameData();
+  });
+
+  // ゲーム強制終了（ホスト権限）
+  socket.on('forceEndGame', () => {
+    if (socket.id !== hostSocketId) return;
+    gameState = 'lobby';
+    for (let id in players) {
+      if (players[id].isBot) {
+        delete players[id];
+      } else {
+        players[id].ready = false;
+        players[id].action = null;
+        players[id].alive = true;
+      }
+    }
     updateGameData();
   });
 
@@ -190,6 +223,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`ユーザー切断: ${socket.id}`);
     delete players[socket.id];
+    assignHostIfNeeded();
     updateGameData();
   });
 });
@@ -230,7 +264,6 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 1. 移動処理（高低差の制限：差が2以上の場合は直接移動不可）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
@@ -244,7 +277,6 @@ function resolveTurn() {
       const maxMove = currentElevation >= 2 ? 2 : 1;
       const dist = Math.abs(p.x - x) + Math.abs(p.y - y);
 
-      // 差が2段階以上離れている場合は移動不可
       if (elevationDiff < 2 && dist <= maxMove && x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
         p.x = x;
         p.y = y;
@@ -262,7 +294,6 @@ function resolveTurn() {
     }
   });
 
-  // 2. 攻撃処理（H3など高い場所から低い場所へは射程ボーナス）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
@@ -302,7 +333,6 @@ function resolveTurn() {
     }
   });
 
-  // 3. 安全地帯縮小
   if (currentTurn % 3 === 0 && safeZoneRadius > 2) {
     safeZoneRadius--;
     logs.push(`⚠️ 安全地帯が縮小した！（安全半径: ${safeZoneRadius}）`);
@@ -338,7 +368,7 @@ function resolveTurn() {
 }
 
 function updateGameData() {
-  io.emit('updateState', { players, gameState, settings, safeZoneRadius });
+  io.emit('updateState', { players, gameState, settings, safeZoneRadius, hostSocketId });
 }
 
 const PORT = process.env.PORT || 3000;
