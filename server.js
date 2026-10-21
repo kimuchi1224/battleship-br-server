@@ -23,7 +23,7 @@ app.use(express.static('public'));
 
 let gameState = 'lobby';
 let settings = {
-  gridSize: 14, // デフォルトを14x14に拡大
+  gridSize: 14,
   botCount: 4
 };
 let players = {};
@@ -32,10 +32,16 @@ let currentTurn = 0;
 let safeZoneRadius = 7;
 let hostSocketId = null;
 
+// パッシブ装備の定義
+const PASSIVE_ITEMS = [
+  { id: 'scope', name: '高倍率スコープ', desc: '射程+1' },
+  { id: 'armor', name: '強化装甲', desc: '被ダメージ-10' },
+  { id: 'engine', name: '高出力エンジン', desc: '移動力+1' }
+];
+
 function generateMap(size) {
   mapObjects = {};
   safeZoneRadius = Math.floor(size / 2);
-  const center = Math.floor(size / 2);
 
   let gridElevations = Array(size).fill(0).map(() => Array(size).fill(1));
   for (let y = 0; y < size; y++) {
@@ -99,8 +105,11 @@ io.on('connection', (socket) => {
     id: socket.id,
     name: `Player_${socket.id.slice(0, 4)}`,
     hp: 100,
+    maxHp: 100,
     ammo: 8,
-    inventory: ['標準砲弾'],
+    passives: [], // パッシブ装備
+    skills: ['sonar', 'smoke'], // スキル所持
+    isSmoking: false, // 煙幕状態フラグ
     action: null,
     alive: true,
     ready: false,
@@ -156,8 +165,11 @@ io.on('connection', (socket) => {
         id: botId,
         name: `🤖 Bot_${i}`,
         hp: 100,
+        maxHp: 100,
         ammo: 8,
-        inventory: ['標準砲弾'],
+        passives: [],
+        skills: ['sonar', 'smoke'],
+        isSmoking: false,
         action: null,
         alive: true,
         ready: true,
@@ -172,6 +184,8 @@ io.on('connection', (socket) => {
       p.y = Math.floor(Math.random() * settings.gridSize);
       p.hp = 100;
       p.ammo = 8;
+      p.passives = [];
+      p.isSmoking = false;
       p.alive = true;
       p.action = null;
     });
@@ -237,8 +251,12 @@ function checkAllActionsSubmitted() {
 function decideBotActions() {
   const aliveBots = Object.values(players).filter(p => p.alive && p.isBot);
   aliveBots.forEach(bot => {
-    const isAttack = Math.random() < 0.5 && bot.ammo > 0;
-    if (isAttack) {
+    const rand = Math.random();
+    if (rand < 0.15 && bot.skills.includes('smoke')) {
+      bot.action = { type: 'skill', skillId: 'smoke' };
+    } else if (rand < 0.3 && bot.skills.includes('sonar')) {
+      bot.action = { type: 'skill', skillId: 'sonar' };
+    } else if (rand < 0.65 && bot.ammo > 0) {
       const targetX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + (Math.floor(Math.random() * 5) - 2)));
       const targetY = Math.max(0, Math.min(settings.gridSize - 1, bot.y + (Math.floor(Math.random() * 5) - 2)));
       bot.action = { type: 'attack', targetX, targetY };
@@ -259,7 +277,36 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 1. 移動判定（確定時の検証）
+  // 煙幕状態のリセット
+  alivePlayers.forEach(p => { p.isSmoking = false; });
+
+  // 1. スキル使用処理（移動・攻撃に先行）
+  alivePlayers.forEach(p => {
+    if (p.action && p.action.type === 'skill') {
+      const { skillId } = p.action;
+      if (skillId === 'smoke') {
+        p.isSmoking = true;
+        logs.push(`💨 ${p.name} が【煙幕】を発動！1ターンの間すべての攻撃を回避！`);
+      } else if (skillId === 'sonar') {
+        logs.push(`📡 ${p.name} が【ソナー】を発動！周囲のソナー波を送信！`);
+        // 他のプレイヤーの方角をログ出力
+        alivePlayers.forEach(target => {
+          if (target.id !== p.id) {
+            const dx = target.x - p.x;
+            const dy = target.y - p.y;
+            let dir = '';
+            if (dy < 0) dir += '北';
+            if (dy > 0) dir += '南';
+            if (dx > 0) dir += '東';
+            if (dx < 0) dir += '西';
+            logs.push(`   └ 探知反応: ${dir}の方角に反応あり！`);
+          }
+        });
+      }
+    }
+  });
+
+  // 2. 移動判定
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
@@ -270,31 +317,45 @@ function resolveTurn() {
       const targetElevation = targetCell ? targetCell.elevation : 1;
       
       const elevationDiff = Math.abs(currentElevation - targetElevation);
-      const maxMove = currentElevation >= 2 ? 2 : 1;
+      // エンジン所持なら移動距離+1
+      const hasEngine = p.passives.some(item => item.id === 'engine');
+      const maxMove = (currentElevation >= 2 || hasEngine) ? 2 : 1;
       const dist = Math.abs(p.x - x) + Math.abs(p.y - y);
 
       if (elevationDiff < 2 && dist <= maxMove && x >= 0 && x < settings.gridSize && y >= 0 && y < settings.gridSize) {
         p.x = x;
         p.y = y;
-        logs.push(`${p.name} が (${x}, ${y}) に移動した`);
+        logs.push(`⚓ ${p.name} が (${x}, ${y}) に移動した`);
 
         const key = `${x},${y}`;
         if (mapObjects[key] && mapObjects[key].type === 'treasure' && !mapObjects[key].opened) {
           mapObjects[key].opened = true;
           p.ammo += 4;
-          logs.push(`✨ ${p.name} が宝箱を発見！弾薬+4獲得！`);
+          
+          // 50%でランダム装備獲得
+          if (Math.random() < 0.5) {
+            const newItem = PASSIVE_ITEMS[Math.floor(Math.random() * PASSIVE_ITEMS.length)];
+            if (!p.passives.some(i => i.id === newItem.id)) {
+              p.passives.push(newItem);
+              logs.push(`🎁 ${p.name} が宝箱から【${newItem.name}】を獲得！(${newItem.desc})`);
+            } else {
+              logs.push(`✨ ${p.name} が宝箱から補給を受け取った！（弾薬+4）`);
+            }
+          } else {
+            logs.push(`✨ ${p.name} が宝箱から補給を受け取った！（弾薬+4）`);
+          }
         }
       } else {
-        logs.push(`❌ ${p.name} の移動は高低差または距離制限により失敗しました`);
+        logs.push(`❌ ${p.name} の移動は失敗しました`);
       }
     }
   });
 
-  // 2. 攻撃判定（確定時の検証）
+  // 3. 攻撃判定
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
-        logs.push(`${p.name} は弾切れで攻撃できなかった！`);
+        logs.push(`⚠️ ${p.name} は弾切れで砲撃できなかった！`);
         return;
       }
       p.ammo--;
@@ -305,44 +366,56 @@ function resolveTurn() {
       const attackerElevation = attackerCell ? attackerCell.elevation : 1;
       const targetElevation = targetCell ? targetCell.elevation : 1;
 
-      let maxRange = 3;
+      // 高倍率スコープ所持なら射程+1
+      const hasScope = p.passives.some(item => item.id === 'scope');
+      let maxRange = 3 + (hasScope ? 1 : 0);
       if (attackerElevation > targetElevation) maxRange += (attackerElevation - targetElevation);
       if (attackerElevation < targetElevation) maxRange -= (targetElevation - attackerElevation);
 
       const dist = Math.max(Math.abs(p.x - targetX), Math.abs(p.y - targetY));
 
       if (dist <= Math.max(1, maxRange) && targetX >= 0 && targetX < settings.gridSize && targetY >= 0 && targetY < settings.gridSize) {
-        logs.push(`${p.name} が (${targetX}, ${targetY}) を砲撃！`);
+        logs.push(`💥 ${p.name} が (${targetX}, ${targetY}) を砲撃！`);
 
         alivePlayers.forEach(target => {
           if (target.id !== p.id && target.x === targetX && target.y === targetY) {
-            target.hp -= 35;
-            logs.push(`🎯 命中！ ${target.name} に35ダメージ！`);
+            if (target.isSmoking) {
+              logs.push(`💨 煙幕により回避！ ${target.name} は攻撃を受けなかった！`);
+              return;
+            }
+
+            // 強化装甲による軽減
+            const hasArmor = target.passives.some(item => item.id === 'armor');
+            const damage = hasArmor ? 25 : 35;
+
+            target.hp -= damage;
+            logs.push(`🎯 命中！ ${target.name} に ${damage} ダメージ！${hasArmor ? '(装甲軽減)' : ''}`);
             if (target.hp <= 0) {
               target.alive = false;
-              logs.push(`💀 ${target.name} は沈没した...`);
+              logs.push(`💀 ${target.name} は撃沈された...`);
             }
           }
         });
       } else {
-        logs.push(`❌ ${p.name} の砲撃は射程外でした`);
+        logs.push(`💥 ${p.name} の砲撃は射程外に着弾した...`);
       }
     }
   });
 
+  // 4. 安全地帯縮小
   if (currentTurn % 3 === 0 && safeZoneRadius > 2) {
     safeZoneRadius--;
-    logs.push(`⚠️ 安全地帯が縮小した！（安全半径: ${safeZoneRadius}）`);
+    logs.push(`⚠️ 安全地帯が縮小！（安全半径: ${safeZoneRadius}）`);
   }
 
   alivePlayers.forEach(p => {
     const distFromCenter = Math.max(Math.abs(p.x - center), Math.abs(p.y - center));
     if (distFromCenter > safeZoneRadius) {
       p.hp -= 20;
-      logs.push(`💨 ${p.name} は安全地帯の外で毒ダメージ20を受けた！`);
+      logs.push(`💨 ${p.name} は安全地帯外で 20 ダメージを受けた！`);
       if (p.hp <= 0) {
         p.alive = false;
-        logs.push(`💀 ${p.name} は毒に呑まれ沈没した...`);
+        logs.push(`💀 ${p.name} は毒ガスで沈没した...`);
       }
     }
   });
