@@ -32,11 +32,13 @@ let currentTurn = 0;
 let safeZoneRadius = 7;
 let hostSocketId = null;
 
-// パッシブ装備の定義
-const PASSIVE_ITEMS = [
-  { id: 'scope', name: '高倍率スコープ', desc: '射程+1' },
-  { id: 'armor', name: '強化装甲', desc: '被ダメージ-10' },
-  { id: 'engine', name: '高出力エンジン', desc: '移動力+1' }
+// ドロップアイテムの定義（パッシブ装備 ＆ 消費型アクティブ道具）
+const ITEM_TABLE = [
+  { id: 'scope', name: '高倍率スコープ', type: 'passive', desc: '射程+1' },
+  { id: 'armor', name: '強化装甲', type: 'passive', desc: '被ダメージ-10' },
+  { id: 'engine', name: '高出力エンジン', type: 'passive', desc: '移動力+1' },
+  { id: 'smoke', name: '煙幕弾', type: 'active', desc: '【使い切り】1ターン攻撃完全回避' },
+  { id: 'sonar', name: 'ソナー装置', type: 'active', desc: '【使い切り】視界外の敵方角を探知' }
 ];
 
 function generateMap(size) {
@@ -72,9 +74,9 @@ function generateMap(size) {
       const key = `${x},${y}`;
       let objType = null;
       const rand = Math.random();
-      if (rand < 0.12) {
+      if (rand < 0.15) {
         objType = 'treasure';
-      } else if (rand < 0.25) {
+      } else if (rand < 0.28) {
         objType = 'grass';
       }
 
@@ -107,9 +109,9 @@ io.on('connection', (socket) => {
     hp: 100,
     maxHp: 100,
     ammo: 8,
-    passives: [], // パッシブ装備
-    skills: ['sonar', 'smoke'], // スキル所持
-    isSmoking: false, // 煙幕状態フラグ
+    passives: [],
+    items: [], // 消費アイテムインベントリ
+    isSmoking: false,
     action: null,
     alive: true,
     ready: false,
@@ -168,7 +170,7 @@ io.on('connection', (socket) => {
         maxHp: 100,
         ammo: 8,
         passives: [],
-        skills: ['sonar', 'smoke'],
+        items: [{ id: 'smoke', name: '煙幕弾', desc: '【使い切り】1ターン攻撃完全回避' }],
         isSmoking: false,
         action: null,
         alive: true,
@@ -185,6 +187,7 @@ io.on('connection', (socket) => {
       p.hp = 100;
       p.ammo = 8;
       p.passives = [];
+      p.items = [];
       p.isSmoking = false;
       p.alive = true;
       p.action = null;
@@ -251,11 +254,12 @@ function checkAllActionsSubmitted() {
 function decideBotActions() {
   const aliveBots = Object.values(players).filter(p => p.alive && p.isBot);
   aliveBots.forEach(bot => {
+    const hasSmoke = bot.items.findIndex(i => i.id === 'smoke');
     const rand = Math.random();
-    if (rand < 0.15 && bot.skills.includes('smoke')) {
-      bot.action = { type: 'skill', skillId: 'smoke' };
-    } else if (rand < 0.3 && bot.skills.includes('sonar')) {
-      bot.action = { type: 'skill', skillId: 'sonar' };
+    
+    if (rand < 0.2 && hasSmoke !== -1) {
+      bot.items.splice(hasSmoke, 1); // 煙幕を消費
+      bot.action = { type: 'item', itemId: 'smoke' };
     } else if (rand < 0.65 && bot.ammo > 0) {
       const targetX = Math.max(0, Math.min(settings.gridSize - 1, bot.x + (Math.floor(Math.random() * 5) - 2)));
       const targetY = Math.max(0, Math.min(settings.gridSize - 1, bot.y + (Math.floor(Math.random() * 5) - 2)));
@@ -277,19 +281,24 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
-  // 煙幕状態のリセット
   alivePlayers.forEach(p => { p.isSmoking = false; });
 
-  // 1. スキル使用処理（移動・攻撃に先行）
+  // 1. 道具・アイテム使用処理
   alivePlayers.forEach(p => {
-    if (p.action && p.action.type === 'skill') {
-      const { skillId } = p.action;
-      if (skillId === 'smoke') {
+    if (p.action && p.action.type === 'item') {
+      const { itemId } = p.action;
+      
+      // 消費チェック
+      const itemIdx = p.items.findIndex(i => i.id === itemId);
+      if (itemIdx !== -1) {
+        p.items.splice(itemIdx, 1); // アイテム消費
+      }
+
+      if (itemId === 'smoke') {
         p.isSmoking = true;
-        logs.push(`💨 ${p.name} が【煙幕】を発動！1ターンの間すべての攻撃を回避！`);
-      } else if (skillId === 'sonar') {
-        logs.push(`📡 ${p.name} が【ソナー】を発動！周囲のソナー波を送信！`);
-        // 他のプレイヤーの方角をログ出力
+        logs.push(`💨 ${p.name} が【煙幕弾】を使用！1ターンの間すべての攻撃を無効化！`);
+      } else if (itemId === 'sonar') {
+        logs.push(`📡 ${p.name} が【ソナー装置】を起動！広域索敵を開始！`);
         alivePlayers.forEach(target => {
           if (target.id !== p.id) {
             const dx = target.x - p.x;
@@ -299,7 +308,7 @@ function resolveTurn() {
             if (dy > 0) dir += '南';
             if (dx > 0) dir += '東';
             if (dx < 0) dir += '西';
-            logs.push(`   └ 探知反応: ${dir}の方角に反応あり！`);
+            logs.push(`   └ 索敵反応: ${dir}の方角に敵の動向あり！`);
           }
         });
       }
@@ -317,7 +326,6 @@ function resolveTurn() {
       const targetElevation = targetCell ? targetCell.elevation : 1;
       
       const elevationDiff = Math.abs(currentElevation - targetElevation);
-      // エンジン所持なら移動距離+1
       const hasEngine = p.passives.some(item => item.id === 'engine');
       const maxMove = (currentElevation >= 2 || hasEngine) ? 2 : 1;
       const dist = Math.abs(p.x - x) + Math.abs(p.y - y);
@@ -332,17 +340,18 @@ function resolveTurn() {
           mapObjects[key].opened = true;
           p.ammo += 4;
           
-          // 50%でランダム装備獲得
-          if (Math.random() < 0.5) {
-            const newItem = PASSIVE_ITEMS[Math.floor(Math.random() * PASSIVE_ITEMS.length)];
-            if (!p.passives.some(i => i.id === newItem.id)) {
-              p.passives.push(newItem);
-              logs.push(`🎁 ${p.name} が宝箱から【${newItem.name}】を獲得！(${newItem.desc})`);
+          // ドロップテーブルから抽選
+          const droppedItem = ITEM_TABLE[Math.floor(Math.random() * ITEM_TABLE.length)];
+          if (droppedItem.type === 'passive') {
+            if (!p.passives.some(i => i.id === droppedItem.id)) {
+              p.passives.push(droppedItem);
+              logs.push(`🎁 ${p.name} が宝箱から装備【${droppedItem.name}】を獲得！(${droppedItem.desc})`);
             } else {
-              logs.push(`✨ ${p.name} が宝箱から補給を受け取った！（弾薬+4）`);
+              logs.push(`✨ ${p.name} が宝箱から補給弾薬を受け取った！（弾薬+4）`);
             }
           } else {
-            logs.push(`✨ ${p.name} が宝箱から補給を受け取った！（弾薬+4）`);
+            p.items.push(droppedItem);
+            logs.push(`🎁 ${p.name} が宝箱から消費道具【${droppedItem.name}】を入手！`);
           }
         }
       } else {
@@ -366,7 +375,6 @@ function resolveTurn() {
       const attackerElevation = attackerCell ? attackerCell.elevation : 1;
       const targetElevation = targetCell ? targetCell.elevation : 1;
 
-      // 高倍率スコープ所持なら射程+1
       const hasScope = p.passives.some(item => item.id === 'scope');
       let maxRange = 3 + (hasScope ? 1 : 0);
       if (attackerElevation > targetElevation) maxRange += (attackerElevation - targetElevation);
@@ -380,11 +388,10 @@ function resolveTurn() {
         alivePlayers.forEach(target => {
           if (target.id !== p.id && target.x === targetX && target.y === targetY) {
             if (target.isSmoking) {
-              logs.push(`💨 煙幕により回避！ ${target.name} は攻撃を受けなかった！`);
+              logs.push(`💨 煙幕展開中！ ${target.name} はすべての着弾を完全に回避した！`);
               return;
             }
 
-            // 強化装甲による軽減
             const hasArmor = target.passives.some(item => item.id === 'armor');
             const damage = hasArmor ? 25 : 35;
 
