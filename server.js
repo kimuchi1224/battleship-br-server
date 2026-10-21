@@ -23,14 +23,14 @@ app.use(express.static('public'));
 
 let gameState = 'lobby';
 let settings = {
-  gridSize: 10,
-  botCount: 3
+  gridSize: 14, // デフォルトを14x14に拡大
+  botCount: 4
 };
 let players = {};
 let mapObjects = {};
 let currentTurn = 0;
-let safeZoneRadius = 5;
-let hostSocketId = null; // ホストのID
+let safeZoneRadius = 7;
+let hostSocketId = null;
 
 function generateMap(size) {
   mapObjects = {};
@@ -66,9 +66,9 @@ function generateMap(size) {
       const key = `${x},${y}`;
       let objType = null;
       const rand = Math.random();
-      if (rand < 0.15) {
+      if (rand < 0.12) {
         objType = 'treasure';
-      } else if (rand < 0.30) {
+      } else if (rand < 0.25) {
         objType = 'grass';
       }
 
@@ -81,7 +81,6 @@ function generateMap(size) {
   }
 }
 
-// ホストを再割り当てする関数
 function assignHostIfNeeded() {
   const humanSockets = Object.keys(players).filter(id => !players[id].isBot);
   if (humanSockets.length > 0) {
@@ -100,7 +99,7 @@ io.on('connection', (socket) => {
     id: socket.id,
     name: `Player_${socket.id.slice(0, 4)}`,
     hp: 100,
-    ammo: 5,
+    ammo: 8,
     inventory: ['標準砲弾'],
     action: null,
     alive: true,
@@ -120,7 +119,6 @@ io.on('connection', (socket) => {
 
   updateGameData();
 
-  // ハンドルネーム変更
   socket.on('updateName', (newName) => {
     if (players[socket.id] && newName.trim() !== '') {
       players[socket.id].name = newName.trim().slice(0, 15);
@@ -128,11 +126,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 設定変更（ホストのみ）
   socket.on('updateSettings', (newSettings) => {
     if (gameState !== 'lobby' || socket.id !== hostSocketId) return;
-    settings.gridSize = parseInt(newSettings.gridSize) || 10;
-    settings.botCount = parseInt(newSettings.botCount) !== undefined ? parseInt(newSettings.botCount) : 3;
+    settings.gridSize = parseInt(newSettings.gridSize) || 14;
+    settings.botCount = parseInt(newSettings.botCount) !== undefined ? parseInt(newSettings.botCount) : 4;
     io.emit('settingsUpdated', settings);
   });
 
@@ -142,7 +139,6 @@ io.on('connection', (socket) => {
     updateGameData();
   });
 
-  // ゲーム開始（ホストのみ、または全員準備完了時）
   socket.on('startGame', () => {
     if (gameState !== 'lobby' || socket.id !== hostSocketId) return;
     
@@ -160,7 +156,7 @@ io.on('connection', (socket) => {
         id: botId,
         name: `🤖 Bot_${i}`,
         hp: 100,
-        ammo: 5,
+        ammo: 8,
         inventory: ['標準砲弾'],
         action: null,
         alive: true,
@@ -175,7 +171,7 @@ io.on('connection', (socket) => {
       p.x = Math.floor(Math.random() * settings.gridSize);
       p.y = Math.floor(Math.random() * settings.gridSize);
       p.hp = 100;
-      p.ammo = 5;
+      p.ammo = 8;
       p.alive = true;
       p.action = null;
     });
@@ -184,7 +180,6 @@ io.on('connection', (socket) => {
     updateGameData();
   });
 
-  // ゲーム強制終了（ホスト権限）
   socket.on('forceEndGame', () => {
     if (socket.id !== hostSocketId) return;
     gameState = 'lobby';
@@ -264,6 +259,7 @@ function resolveTurn() {
 
   logs.push(`--- ターン ${currentTurn} 解決 ---`);
 
+  // 1. 移動判定（確定時の検証）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'move') {
       const { x, y } = p.action;
@@ -285,15 +281,16 @@ function resolveTurn() {
         const key = `${x},${y}`;
         if (mapObjects[key] && mapObjects[key].type === 'treasure' && !mapObjects[key].opened) {
           mapObjects[key].opened = true;
-          p.ammo += 3;
-          logs.push(`✨ ${p.name} が宝箱を発見！弾薬+3獲得！`);
+          p.ammo += 4;
+          logs.push(`✨ ${p.name} が宝箱を発見！弾薬+4獲得！`);
         }
       } else {
-        logs.push(`${p.name} の移動先は高低差が激しすぎるか遠すぎます`);
+        logs.push(`❌ ${p.name} の移動は高低差または距離制限により失敗しました`);
       }
     }
   });
 
+  // 2. 攻撃判定（確定時の検証）
   alivePlayers.forEach(p => {
     if (p.action && p.action.type === 'attack') {
       if (p.ammo <= 0) {
@@ -328,7 +325,7 @@ function resolveTurn() {
           }
         });
       } else {
-        logs.push(`${p.name} の砲撃は射程外だった...`);
+        logs.push(`❌ ${p.name} の砲撃は射程外でした`);
       }
     }
   });
